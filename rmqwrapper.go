@@ -45,30 +45,40 @@ func Connect(ctx context.Context, config Config) (*amqp.Connection, error) {
 	return conn, nil
 }
 
-// monitorConnection watches for connection issues and attempts to reconnect
+// monitorConnection watches the current connection and reconnects when the broker closes it.
+// It is the only monitor for the connection's lifetime: reconnect swaps the connection and the
+// loop then watches the new one. It stops on ctx, or when the connection is closed on purpose.
 func monitorConnection(ctx context.Context, config Config) {
 	for {
+		conn := GetConnection()
+		if conn == nil {
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case err := <-RMQConn.NotifyClose(make(chan *amqp.Error)):
-			if err != nil {
-				fmt.Printf("RabbitMQ connection closed: %v. Attempting to reconnect...\n", err)
-				reconnect(ctx, config)
+		case err, ok := <-conn.NotifyClose(make(chan *amqp.Error, 1)):
+			if !ok || err == nil {
+				return
+			}
+			fmt.Printf("RabbitMQ connection closed: %v. Attempting to reconnect...\n", err)
+			if !reconnect(ctx, config) {
+				return
 			}
 		}
 	}
 }
 
-// reconnect attempts to reconnect to RabbitMQ with exponential backoff
-func reconnect(ctx context.Context, config Config) {
+// reconnect dials until it succeeds, with exponential backoff, and swaps the connection in. It
+// returns false if ctx is done first.
+func reconnect(ctx context.Context, config Config) bool {
 	delay := config.ReconnectDelay
 	maxDelay := config.MaxReconnectTime
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(delay):
 			conn, err := amqp.Dial(config.URL)
 			if err != nil {
@@ -85,8 +95,7 @@ func reconnect(ctx context.Context, config Config) {
 			connLock.Unlock()
 
 			fmt.Println("Successfully reconnected to RabbitMQ")
-			go monitorConnection(ctx, config)
-			return
+			return true
 		}
 	}
 }
